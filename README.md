@@ -1,4 +1,4 @@
-# cmd-ai (tell)
+# Tell
 
 Linux-only CLI that turns natural language into shell commands using Groq and asks for confirmation before running them.
 
