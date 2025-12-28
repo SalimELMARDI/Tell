@@ -6,12 +6,15 @@ from __future__ import annotations
 import os
 import platform
 import subprocess
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict
 
 import typer
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
 from rich.syntax import Syntax
+
+# --- NEW IMPORTS ---
+from tell.utils import load_history, save_history, clear_history
 
 try:
     from dotenv import load_dotenv
@@ -43,16 +46,31 @@ def detect_shell() -> Tuple[str, str]:
     return os.path.basename(shell_path).lower(), shell_path
 
 
-def build_system_prompt(os_name: str, shell_name: str) -> str:
+def get_directory_context(max_files: int = 50) -> str:
+    """Returns a comma-separated list of filenames in the current directory."""
+    try:
+        files = [f for f in os.listdir(".") if not f.startswith(".")]
+        files.sort()
+        if len(files) > max_files:
+            return ", ".join(files[:max_files]) + f", ... (+{len(files) - max_files} more)"
+        if not files:
+            return "(Empty Directory)"
+        return ", ".join(files)
+    except Exception:
+        return "(Could not read directory)"
+
+
+def build_system_prompt(os_name: str, shell_name: str, file_context: str) -> str:
     return (
         "You are a command generator for Linux. Return ONLY the raw command string; "
         "no markdown, no backticks, no explanations. "
-        f"Target OS: {os_name}. Shell: {shell_name}. Prefer GNU coreutils."
+        f"Target OS: {os_name}. Shell: {shell_name}. "
+        f"The user is currently in a directory containing these files: [{file_context}]. "
+        "Use this context to resolve vague requests (e.g., 'make it recursive' refers to previous command)."
     )
 
 
 def strip_command(command: str) -> str:
-    # Remove fenced code blocks or stray backticks if the model ignores instructions.
     cleaned = command.strip()
     if cleaned.startswith("```"):
         cleaned = "\n".join(cleaned.split("\n")[1:])
@@ -84,15 +102,23 @@ def ensure_groq() -> Groq:
 
 def generate_command(prompt: str, os_name: str, shell_name: str) -> str:
     client = ensure_groq()
-    system_prompt = build_system_prompt(os_name, shell_name)
+    file_context = get_directory_context()
+    system_prompt = build_system_prompt(os_name, shell_name, file_context)
+
+    # --- MEMORY LOGIC START ---
+    # 1. Load past conversation
+    history = load_history()
+
+    # 2. Build the full message chain: System -> History -> Current User Prompt
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": prompt.strip()})
+    # --- MEMORY LOGIC END ---
 
     try:
         response = client.chat.completions.create(
             model="openai/gpt-oss-20b",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt.strip()},
-            ],
+            messages=messages,
             temperature=0,
         )
     except Exception as exc:
@@ -105,11 +131,16 @@ def generate_command(prompt: str, os_name: str, shell_name: str) -> str:
         console.print("[red]No command returned by model.[/red]")
         raise typer.Exit(code=1)
 
+    # --- SAVE TO MEMORY ---
+    # Append the new interaction and save it
+    history.append({"role": "user", "content": prompt.strip()})
+    history.append({"role": "assistant", "content": command})
+    save_history(history)
+
     return command
 
 
 def run_command(command: str, shell_path: str) -> int:
-    # Execute using the detected shell for better compatibility.
     try:
         completed = subprocess.run(command, shell=True, executable=shell_path)
     except FileNotFoundError as exc:
@@ -162,6 +193,12 @@ def interactive_loop(os_name: str, shell_name: str, shell_path: str) -> None:
         if prompt.strip().lower() in {"exit", "quit"}:
             break
 
+        # Add support for 'clear' inside interactive mode
+        if prompt.strip().lower() == "clear":
+            clear_history()
+            console.print("[green]History cleared.[/green]")
+            continue
+
         handle_prompt(prompt, os_name, shell_name, shell_path, exit_on_abort=False)
 
 
@@ -171,8 +208,18 @@ def main(
     interactive: bool = typer.Option(
         False, "--interactive", "-i", help="Start interactive mode."
     ),
+    clear: bool = typer.Option(
+        False, "--clear", help="Clear conversation history."
+    ),
 ) -> None:
     """Generate a shell command using Groq and optionally execute it."""
+
+    # --- HANDLE CLEAR FLAG ---
+    if clear:
+        clear_history()
+        console.print("[green]Conversation history cleared.[/green]")
+        raise typer.Exit()
+
     os_name = detect_os()
     shell_name, shell_path = detect_shell()
 
